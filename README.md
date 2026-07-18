@@ -7,8 +7,9 @@ reference-list entry.
 
 ## What it checks
 
-1. **Extraction & cross-matching** — every in-text `(Author, Year)` citation
-   is matched against the reference list.
+1. **Extraction & cross-matching** — every in-text citation is matched
+   against the reference list, in whichever format your target journal
+   requires (see "Citation style" below).
    - *Orphan citations*: cited in text, no matching reference entry — the
      strongest fabrication signal.
    - *Orphan references*: listed but never cited — a common manuscript-hygiene
@@ -24,6 +25,30 @@ reference-list entry.
    claim" — the failure mode CrossRef/Zotero checks can't see.
 5. **Hyperlinked output** — a copy of your manuscript where every citation is
    an internal Word hyperlink to its reference entry.
+
+## Citation style
+
+Type your target journal or style name (e.g. "Vancouver", "IEEE", "Nature",
+or the exact journal name) in the sidebar. This is looked up live against
+**Zotero's public catalog of ~10,850 CSL styles** — the same catalog Zotero
+itself uses — so the app knows whether that style is numeric (`[1]`) or
+author-date (`Author, Year`) from an authoritative source, not a guess. No
+Zotero account is needed for this — it's an open public catalog, separate
+from your personal library (used only in the optional Zotero cross-check).
+
+Leave the field blank to auto-detect the style from your manuscript's own
+reference-list formatting instead.
+
+Two style categories aren't yet supported by extraction/hyperlinking: CSL
+"note" styles (footnote-based, common in humanities/law) and "label" styles
+(rare). If your target style falls into one of these, the app tells you and
+offers a manual fallback (treat citations as numbered or author-year anyway,
+or auto-detect).
+
+Numbered style supports `[1]`, `(1)`, `[2,3]`, `[4-6]` citations matched to
+a numbered reference list. It cannot detect bare superscript numbers with no
+brackets — plain text can't distinguish a superscript reference mark from an
+ordinary digit — bracket them first if your draft uses that convention.
 
 ## Setup
 
@@ -61,6 +86,7 @@ the running Streamlit session's memory.
 app.py                        Streamlit UI
 scripts/
   docx_utils.py                docx -> plain text
+  csl_style.py                 live lookup against Zotero's public CSL style catalog
   extract_citations.py         citation/reference extraction + cross-matching
   verify_crossref.py           fabrication check via CrossRef
   verify_zotero.py             personal-library cross-check via Zotero API

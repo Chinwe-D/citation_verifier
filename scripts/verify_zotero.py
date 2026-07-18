@@ -77,7 +77,8 @@ def title_overlap(a: str, b: str) -> float:
 
 def assess_entry(ref, api_key, library_id, library_type):
     title_guess = extract_title_guess(ref["raw"])
-    items = zotero_search(ref["first_author_surname"] or title_guess, api_key, library_id, library_type)
+    search_query = ref.get("first_author_surname") or title_guess
+    items = zotero_search(search_query, api_key, library_id, library_type)
 
     if isinstance(items, dict) and "error" in items:
         return {**ref, "zotero_status": "LOOKUP_FAILED", "zotero_detail": items["error"]}

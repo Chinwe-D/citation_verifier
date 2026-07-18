@@ -31,6 +31,9 @@ from docx import Document
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
+sys.path.insert(0, __file__.rsplit("/", 1)[0])
+from extract_citations import detect_citation_style
+
 
 def make_bookmark_start(bookmark_id, name):
     el = OxmlElement("w:bookmarkStart")
@@ -81,6 +84,8 @@ def slugify(surname, year):
 
 REF_HEADING_PAT = re.compile(r"^\s*References?\s*$", re.IGNORECASE)
 REF_ENTRY_PAT = re.compile(r"^([A-Z][A-Za-zÀ-ÿ\-']+)[,.\s].*?\((\d{4}[a-z]?(?:/\d{4})?)\)")
+NUMBERED_REF_ENTRY_PAT = re.compile(r"^\s*\[?(\d{1,3})\]?[\.\):]?\s+\S")
+NUMBERED_INTEXT_PAT = re.compile(r"[\[\(]\s*(\d{1,3}(?:\s*[-,–]\s*\d{1,3})*)\s*[\]\)]")
 
 NARRATIVE_PAT = re.compile(
     r"\b([A-Z][A-Za-zÀ-ÿ\-']+)(?:\s+(?:et al\.|and\s+[A-Z][A-Za-zÀ-ÿ\-']+))?\s*"
@@ -248,12 +253,150 @@ def link_citations_in_paragraph(p, ref_keys, unlinked_report):
             parent.insert(idx + i, el)
 
 
+def bookmark_references_numbered(doc, ref_start_idx):
+    """Bookmark each numbered reference-list paragraph. Returns {number: anchor}."""
+    bookmark_id = 2000
+    ref_numbers = {}
+    for p in doc.paragraphs[ref_start_idx + 1:]:
+        text = p.text.strip()
+        if not text:
+            continue
+        m = NUMBERED_REF_ENTRY_PAT.match(text)
+        if not m:
+            continue
+        number = int(m.group(1))
+        anchor = f"ref_num_{number}"
+        ref_numbers[number] = anchor
+
+        first_run_el = p.runs[0]._r if p.runs else None
+        start_el = make_bookmark_start(bookmark_id, anchor)
+        end_el = make_bookmark_end(bookmark_id)
+        if first_run_el is not None:
+            first_run_el.addprevious(start_el)
+            p._p.append(end_el)
+        else:
+            p._p.insert(0, start_el)
+            p._p.append(end_el)
+        bookmark_id += 1
+    return ref_numbers
+
+
+def link_citations_in_paragraph_numbered(p, ref_numbers, unlinked_report):
+    """
+    Hyperlink [1], [2,3], [4-6] style citations. Since a single bracket
+    group can reference several numbers at once (e.g. '[4-6]'), and Word
+    hyperlinks can only point at one bookmark, a multi-number group links
+    to its *first* valid number -- the group still reads correctly and
+    lands the reader in the reference list, just not on every number in a
+    range individually.
+    """
+    runs = p.runs
+    if not runs:
+        return
+    offsets = []
+    pos = 0
+    for r in runs:
+        offsets.append((pos, pos + len(r.text), r))
+        pos += len(r.text)
+    full_text = "".join(r.text for r in runs)
+
+    matches = []
+    for m in NUMBERED_INTEXT_PAT.finditer(full_text):
+        group = m.group(1)
+        numbers = []
+        for part in re.split(r",\s*", group):
+            part = part.strip()
+            if "-" in part or "–" in part:
+                a, b = re.split(r"[-–]", part)
+                a, b = int(a), int(b)
+                if 0 < b - a < 50:
+                    numbers.extend(range(a, b + 1))
+            elif part.isdigit():
+                numbers.append(int(part))
+        valid = [n for n in numbers if n in ref_numbers]
+        if not valid:
+            continue
+        matches.append((m.start(), m.end(), valid[0], group))
+
+    if not matches:
+        return
+
+    by_run = {}
+    for start, end, number, group in matches:
+        target = None
+        for r_start, r_end, run in offsets:
+            if r_start <= start and end <= r_end:
+                target = (r_start, r_end, run)
+                break
+        if target is None:
+            unlinked_report.append(f"[{group}] -- spans multiple runs, left unlinked")
+            continue
+        by_run.setdefault(id(target[2]), (target, []))[1].append((start, end, number, group))
+
+    for (r_start, r_end, run), run_matches in by_run.values():
+        run_matches.sort(key=lambda x: x[0])
+        full_run_text = run.text
+        run_el = run._r
+        parent = run_el.getparent()
+        idx = list(parent).index(run_el)
+
+        new_elements = []
+        cursor = 0
+        for start, end, number, group in run_matches:
+            local_start, local_end = start - r_start, end - r_start
+            before_text = full_run_text[cursor:local_start]
+            citation_text = full_run_text[local_start:local_end]
+            if before_text:
+                before_run = copy.deepcopy(run_el)
+                t = before_run.find(qn("w:t"))
+                t.text = before_text
+                t.set(qn("xml:space"), "preserve")
+                new_elements.append(before_run)
+            new_elements.append(make_hyperlink_run(ref_numbers[number], citation_text, run_el))
+            cursor = local_end
+
+        tail_text = full_run_text[cursor:]
+        if tail_text:
+            after_run = copy.deepcopy(run_el)
+            t = after_run.find(qn("w:t"))
+            t.text = tail_text
+            t.set(qn("xml:space"), "preserve")
+            new_elements.append(after_run)
+
+        parent.remove(run_el)
+        for i, el in enumerate(new_elements):
+            parent.insert(idx + i, el)
+
+
+def link_manuscript(doc, ref_start_idx, style="auto"):
+    """
+    Style-aware linking entry point used by the app. Returns
+    (resolved_style, ambiguity_report, unlinked_report).
+    """
+    ref_text_block = "\n\n".join(p.text for p in doc.paragraphs[ref_start_idx + 1:])
+    resolved_style = detect_citation_style(ref_text_block) if style == "auto" else style
+
+    ambiguity_report, unlinked_report = [], []
+    if resolved_style == "numbered":
+        ref_numbers = bookmark_references_numbered(doc, ref_start_idx)
+        for p in doc.paragraphs[:ref_start_idx]:
+            link_citations_in_paragraph_numbered(p, ref_numbers, unlinked_report)
+    else:
+        resolved_style = "author_year"
+        ref_keys = bookmark_references(doc, ref_start_idx, ambiguity_report)
+        for p in doc.paragraphs[:ref_start_idx]:
+            link_citations_in_paragraph(p, ref_keys, unlinked_report)
+
+    return resolved_style, ambiguity_report, unlinked_report
+
+
 def main():
-    if len(sys.argv) != 3:
-        print("Usage: python link_citations.py manuscript.docx output.docx")
+    if len(sys.argv) not in (3, 4):
+        print("Usage: python link_citations.py manuscript.docx output.docx [author_year|numbered|auto]")
         sys.exit(1)
 
     in_path, out_path = sys.argv[1], sys.argv[2]
+    style = sys.argv[3] if len(sys.argv) == 4 else "auto"
     doc = Document(in_path)
 
     ref_start_idx = find_references_section(doc)
@@ -261,14 +404,8 @@ def main():
         print("Could not find a 'References' heading paragraph -- aborting.")
         sys.exit(1)
 
-    ambiguity_report = []
-    ref_keys = bookmark_references(doc, ref_start_idx, ambiguity_report)
-    n_entries = sum(len(v) for v in ref_keys.values())
-    print(f"Bookmarked {n_entries} reference entries ({len(ref_keys)} unique author-year keys).")
-
-    unlinked_report = []
-    for p in doc.paragraphs[:ref_start_idx]:
-        link_citations_in_paragraph(p, ref_keys, unlinked_report)
+    resolved_style, ambiguity_report, unlinked_report = link_manuscript(doc, ref_start_idx, style)
+    print(f"Detected/using style: {resolved_style}")
 
     doc.save(out_path)
     print(f"Saved hyperlinked manuscript to {out_path}")

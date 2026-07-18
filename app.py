@@ -24,11 +24,12 @@ import pandas as pd
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
 
 from docx_utils import docx_to_text
-from extract_citations import split_references, parse_reference_entries, find_intext_citations, cross_match
+from extract_citations import extract
 import verify_crossref
 import verify_zotero
 import claim_support_check
 import link_citations
+import csl_style
 
 
 st.set_page_config(page_title="Manuscript Citation Verifier", layout="wide")
@@ -42,7 +43,65 @@ st.caption(
 # ---------------------------------------------------------------------------
 # Sidebar: optional credentials
 # ---------------------------------------------------------------------------
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_style_index():
+    """Zotero's public CSL style catalog (~10,850 styles) -- no account needed,
+    this is an open catalog, separate from your personal Zotero library."""
+    try:
+        return csl_style.fetch_style_index()
+    except Exception:
+        return None
+
+
 with st.sidebar:
+    st.header("Citation style")
+    style_query = st.text_input(
+        "Target journal or style name",
+        placeholder="e.g. Vancouver, IEEE, Nature, APA, or your journal's exact name",
+        help="Looked up live against Zotero's public catalog of ~10,850 CSL styles -- "
+             "the same catalog Zotero itself uses -- so the style you name is the "
+             "actual style your target journal requires, not a guess.",
+    )
+
+    citation_style = "auto"
+    style_resolution = None
+    style_index = load_style_index()
+
+    if style_query.strip():
+        if style_index is None:
+            st.warning("Couldn't reach Zotero's style catalog right now -- falling back to auto-detect from your reference list.")
+        else:
+            candidates = csl_style.search_styles(style_query, style_index, limit=5)
+            if not candidates:
+                st.warning(f"No style matched '{style_query}'. Falling back to auto-detect from your reference list, "
+                           "or try a shorter/different name (e.g. the bare journal name without 'Journal of').")
+            else:
+                options = [c.get("title") for c in candidates]
+                chosen_title = st.selectbox("Matched style", options,
+                                             help="Zotero's catalog can return several close matches -- pick the right one.")
+                chosen = next(c for c in candidates if c.get("title") == chosen_title)
+                csl_format = chosen.get("categories", {}).get("format")
+                pipeline_style = csl_style.FORMAT_TO_PIPELINE_STYLE.get(csl_format)
+
+                if pipeline_style:
+                    citation_style = pipeline_style
+                    style_resolution = f"'{chosen_title}' uses **{csl_format}** citations."
+                    st.success(style_resolution)
+                else:
+                    st.warning(
+                        f"'{chosen_title}' uses **{csl_format or 'an unknown'}** citation format, which this "
+                        "pipeline doesn't yet extract/hyperlink (only numeric and author-date styles are "
+                        "supported so far). Choose a fallback below, or auto-detect instead."
+                    )
+                    fallback = st.radio("Fallback", ["Auto-detect from my reference list",
+                                                      "Treat as Numbered anyway",
+                                                      "Treat as Author-Year anyway"], index=0)
+                    citation_style = {"Auto-detect from my reference list": "auto",
+                                       "Treat as Numbered anyway": "numbered",
+                                       "Treat as Author-Year anyway": "author_year"}[fallback]
+    else:
+        st.caption("Leave blank to auto-detect the style from your manuscript's own reference list instead.")
+
     st.header("Optional checks")
 
     st.subheader("Zotero (confirm you hold each source)")
@@ -77,16 +136,19 @@ if run and uploaded is not None:
 
     # --- Step 1: extract ---------------------------------------------------
     text = docx_to_text(docx_path)
-    body, ref_block = split_references(text)
-    if not ref_block.strip():
+    result = extract(text, style=citation_style)
+    if result.get("no_references_found"):
         st.error("Couldn't find a 'References' heading in this document. "
                  "Make sure the reference list has its own heading paragraph (e.g. 'References').")
         st.stop()
 
-    ref_entries = parse_reference_entries(ref_block)
-    citations = find_intext_citations(body)
-    orphan_citations, orphan_references = cross_match(citations, ref_entries)
-    progress.progress(0.15, text=f"Found {len(ref_entries)} references, {len(citations)} in-text citations.")
+    resolved_style = result["style"]
+    ref_entries = result["ref_entries"]
+    citations = result["citations"]
+    orphan_citations = result["orphan_citations"]
+    orphan_references = result["orphan_references"]
+    progress.progress(0.15, text=f"Found {len(ref_entries)} references, {len(citations)} in-text citations "
+                                  f"({resolved_style.replace('_', '-')} style).")
 
     # --- Step 2: CrossRef ---------------------------------------------------
     crossref_results = []
@@ -115,14 +177,23 @@ if run and uploaded is not None:
             os.environ["SEMANTIC_SCHOLAR_API_KEY"] = s2_key
         claim_results = []
         subset = citations[:max_claims]
+        ref_by_number = {r.get("number"): r for r in ref_entries} if resolved_style == "numbered" else {}
         for i, c in enumerate(subset):
-            paper = claim_support_check.fetch_abstract(f"{c['surname']} {c['year']}")
+            if resolved_style == "numbered":
+                ref = ref_by_number.get(c["number"])
+                query = verify_crossref.extract_title_guess(ref["raw"]) if ref else None
+                citation_label = f"[{c['number']}]"
+            else:
+                query = f"{c['surname']} {c['year']}"
+                citation_label = f"{c['surname']} ({c['year']})"
+
+            paper = claim_support_check.fetch_abstract(query) if query else None
             if not paper:
                 claim_results.append({**c, "verdict": "NO_ABSTRACT_FOUND",
                                        "reasoning": "Could not retrieve an abstract -- verify manually."})
             else:
                 verdict = claim_support_check.ask_claude_claim_support(
-                    c["sentence"], c["raw"], paper["abstract"], anthropic_key
+                    c["sentence"], citation_label, paper["abstract"], anthropic_key
                 )
                 claim_results.append({**c, "matched_paper_title": paper.get("title"), **verdict})
             progress.progress(0.65 + 0.25 * (i + 1) / max(len(subset), 1),
@@ -136,11 +207,9 @@ if run and uploaded is not None:
     try:
         doc = link_citations.Document(docx_path)
         ref_start_idx = link_citations.find_references_section(doc)
-        ambiguity_report = []
-        ref_keys = link_citations.bookmark_references(doc, ref_start_idx, ambiguity_report)
-        unlinked_report = []
-        for p in doc.paragraphs[:ref_start_idx]:
-            link_citations.link_citations_in_paragraph(p, ref_keys, unlinked_report)
+        _, ambiguity_report, unlinked_report = link_citations.link_manuscript(
+            doc, ref_start_idx, style=resolved_style
+        )
         doc.save(linked_path)
     except Exception as e:
         linked_path = None
@@ -150,6 +219,7 @@ if run and uploaded is not None:
     progress.empty()
 
     st.session_state["results"] = {
+        "style": resolved_style,
         "ref_entries": ref_entries,
         "citations": citations,
         "orphan_citations": orphan_citations,
@@ -167,6 +237,9 @@ if run and uploaded is not None:
 # ---------------------------------------------------------------------------
 if "results" in st.session_state:
     r = st.session_state["results"]
+
+    style_label = "Numbered (IEEE/Vancouver)" if r["style"] == "numbered" else "Author-Year (APA/Harvard)"
+    st.caption(f"Detected/using style: **{style_label}**")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("References found", len(r["ref_entries"]))
@@ -204,15 +277,21 @@ if "results" in st.session_state:
         with col1:
             st.subheader("Orphan citations (cited, no reference entry)")
             if r["orphan_citations"]:
-                st.dataframe(pd.DataFrame(r["orphan_citations"])[["surname", "year", "sentence"]],
-                             use_container_width=True, hide_index=True)
+                if r["style"] == "numbered":
+                    df = pd.DataFrame(r["orphan_citations"])[["number", "sentence"]]
+                else:
+                    df = pd.DataFrame(r["orphan_citations"])[["surname", "year", "sentence"]]
+                st.dataframe(df, use_container_width=True, hide_index=True)
             else:
                 st.success("None -- every in-text citation has a matching reference.")
         with col2:
             st.subheader("Orphan references (listed, never cited)")
             if r["orphan_references"]:
-                st.dataframe(pd.DataFrame(r["orphan_references"])[["first_author_surname", "year", "raw"]],
-                             use_container_width=True, hide_index=True)
+                if r["style"] == "numbered":
+                    df = pd.DataFrame(r["orphan_references"])[["number", "raw"]]
+                else:
+                    df = pd.DataFrame(r["orphan_references"])[["first_author_surname", "year", "raw"]]
+                st.dataframe(df, use_container_width=True, hide_index=True)
             else:
                 st.success("None -- every reference is cited somewhere in the text.")
 
@@ -244,7 +323,7 @@ if "results" in st.session_state:
                       "UNCLEAR": "⚪", "NO_ABSTRACT_FOUND": "⚪", "CHECK_FAILED": "⚪"}
             rows = [{
                 "Verdict": f"{vcolor.get(res.get('verdict'), '')} {res.get('verdict')}",
-                "Citation": f"{res['surname']} ({res['year']})",
+                "Citation": f"[{res['number']}]" if r["style"] == "numbered" else f"{res['surname']} ({res['year']})",
                 "Sentence": res["sentence"][:150] + ("..." if len(res["sentence"]) > 150 else ""),
                 "Reasoning": res.get("reasoning", ""),
             } for res in r["claim_results"]]

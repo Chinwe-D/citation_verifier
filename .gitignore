@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.docx
+!sample_manuscripts/*.docx
+*.json
+!package.json
+.streamlit/secrets.toml
+.env
+*.pdf
+*.jpg
+*.jpeg
